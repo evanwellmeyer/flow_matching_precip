@@ -42,7 +42,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import xarray as xr
 
-from flow_models   import Unet6R_05x
+from flow_models   import Unet6R
 from flow_datasets import (FlowDataset, model_family, load_nc_field, load_zarr_field)
 
 # configuration
@@ -54,11 +54,11 @@ LANDMASK_PATH  = Path("/Users/ewellmeyer/Documents/research/HadGEM/hadgem_landma
 WEIGHTS_DIR    = Path("/Users/ewellmeyer/Documents/research/weights")
 
 
-N_ENSEMBLE   = 5     
+N_ENSEMBLE   = 1     
 PATIENCE     = 30     
-BATCH_SIZE   = 16
-LR           = 1e-4
-N_EPOCHS     = 2000
+BATCH_SIZE   = 100
+LR           = 1e-3
+N_EPOCHS     = 100
 GRAD_CLIP    = 1.0
 P_DROP       = 0.0
 P_AUG        = 0.8   # probability of cross-model trend augmentation (AMIP)
@@ -67,8 +67,8 @@ OCEAN_WEIGHT = 0.3   # loss weight for ocean pixels (soft downweight for base)
 USE_AMP      = True
 DEVICE       = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
-
-EXPT_NAME   = f"flow_base_unet6R05x_ch256_land10_oce{OCEAN_WEIGHT}_aug{P_AUG}"
+BASE_CHANNELS = 2
+EXPT_NAME   = f"flow_base_unet6R_ch{BASE_CHANNELS}_land10_oce{OCEAN_WEIGHT}_aug{P_AUG}"
 WEIGHTS_DIR = WEIGHTS_DIR / EXPT_NAME
 WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -206,8 +206,9 @@ def main():
         np.random.seed(member_idx)
         random.seed(member_idx)
  
-        model     = Unet6R_05x(input_channels=2, output_channels=1,
-                                p_drop=P_DROP).to(DEVICE)
+        model     = Unet6R(input_channels=2, output_channels=1,
+                           base_channels=BASE_CHANNELS,
+                           p_drop=P_DROP).to(DEVICE)
         optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-5)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                         optimizer, T_max=N_EPOCHS, eta_min=LR * 0.01)
@@ -219,7 +220,21 @@ def main():
         best_val      = float("inf")
         patience_count = 0
         log           = []
- 
+
+        start_epoch = 1
+        if save_path.exists():
+            ckpt = torch.load(save_path, map_location=DEVICE)
+            model.load_state_dict(ckpt["state_dict"])
+            best_val = ckpt["val_loss"]
+            print(f"  loaded checkpoint from epoch {ckpt['epoch']}  "
+                f"(val_loss={best_val:.5f})")
+            # optionally reload log to append
+            if log_path.exists():
+                with open(log_path) as f:
+                    log = json.load(f)
+                start_epoch = log[-1]["epoch"] + 1
+                print(f"  resuming from epoch {start_epoch}")
+
         epoch_start = time.time()
  
         for epoch in range(1, N_EPOCHS + 1):
@@ -258,15 +273,15 @@ def main():
                 train_loss += loss.item()
  
                 # print first-batch confirmation and periodic batch updates
-                if batch_idx == 0 and epoch == 1:
-                    print(f"  first batch done ({time.time()-t_epoch:.1f}s)  "
-                          f"loss={loss.item():.5f}")
-                elif batch_idx > 0 and batch_idx % 100 == 0:
-                    elapsed = time.time() - t_epoch
-                    pct     = (batch_idx + 1) / n_batches * 100
-                    print(f"  epoch {epoch:3d}  batch {batch_idx+1}/{n_batches} "
-                          f"({pct:.0f}%)  loss={loss.item():.5f}  "
-                          f"elapsed={elapsed:.1f}s", flush=True)
+                # if batch_idx == 0 and epoch == 1:
+                #     print(f"  first batch done ({time.time()-t_epoch:.1f}s)  "
+                #           f"loss={loss.item():.5f}")
+                # elif batch_idx > 0 and batch_idx % 100 == 0:
+                #     elapsed = time.time() - t_epoch
+                #     pct     = (batch_idx + 1) / n_batches * 100
+                #     print(f"  epoch {epoch:3d}  batch {batch_idx+1}/{n_batches} "
+                #           f"({pct:.0f}%)  loss={loss.item():.5f}  "
+                #           f"elapsed={elapsed:.1f}s", flush=True)
  
             train_loss /= len(train_loader)
  
@@ -290,7 +305,7 @@ def main():
             log.append({"epoch": epoch, "train": train_loss, "val": val_loss,
                         "epoch_time": epoch_time})
  
-            if epoch % 10 == 0:
+            if epoch % 1 == 0:
                 elapsed_total = time.time() - epoch_start
                 eta = elapsed_total / epoch * (N_EPOCHS - epoch)
                 print(f"  epoch {epoch:3d}/{N_EPOCHS}  "

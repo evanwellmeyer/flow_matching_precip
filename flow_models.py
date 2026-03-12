@@ -8,7 +8,26 @@ Exports
   CustomPad          : reflect (lat) + circular (lon) padding
   ConvResBlockSingle : single-conv residual block with GroupNorm + Mish
   SinusoidalEmbedding: sinusoidal time embedding projected to bottleneck dim
-  Unet6R_05x         : hourglass U-Net velocity field predictor
+  Unet6R             : 6-level U-Net velocity field predictor, parameterized
+                       by base_channels for easy scaling
+
+Scaling guide (base_channels)
+------------------------------
+  base=2  : dev/MPS — fast iteration, minimal capacity
+  base=4  : mid — good for GPU training runs
+  base=8  : large — upper bound, comparable to serious climate emulators
+
+Channel progression (standard pyramid: narrow input, wide bottleneck)
+  c1  = base * 1    (full resolution,   128x192)
+  c2  = base * 2    (64x96)
+  c4  = base * 4    (32x48)
+  c8  = base * 8    (16x24)
+  c16 = base * 16   (8x12)
+  c32 = base * 32   (4x6)
+  c64 = base * 64   (2x3  — bottleneck)
+
+The time embedding out_dim is always c64 regardless of base_channels,
+so it is injected additively at the bottleneck without a dimension mismatch.
 """
 
 import numpy as np
@@ -58,9 +77,6 @@ class SinusoidalEmbedding(nn.Module):
     """
     Maps scalar t in [0, 1] to a sinusoidal feature vector of length `dim`,
     then projects to `out_dim` for additive injection at the bottleneck.
-
-    Using a 2-layer MLP projection gives the network flexibility to
-    modulate bottleneck features non-linearly as a function of t.
     """
     def __init__(self, dim=64, out_dim=8):
         super().__init__()
@@ -78,17 +94,19 @@ class SinusoidalEmbedding(nn.Module):
         freqs = torch.exp(
             -torch.arange(half, device=t.device) * (np.log(10000) / (half - 1))
         )
-        args = t[:, None] * freqs[None, :]                      # (B, half)
+        args = t[:, None] * freqs[None, :]
         emb  = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)  # (B, dim)
-        return self.proj(emb)                                    # (B, out_dim)
+        return self.proj(emb)                                          # (B, out_dim)
 
 
-class Unet6R_05x(nn.Module):
+class Unet6R(nn.Module):
     """
-    Hourglass U-Net for predicting the conditional flow matching velocity field.
+    6-level U-Net for predicting the conditional flow matching velocity field.
 
-    Channels decrease from 256 at the input to 8 at the bottleneck (2x3 spatial
-    resolution for 128x192 input), then mirror back up through skip connections.
+    Channel width scales as powers of 2 from base_channels at the input up to
+    base_channels * 64 at the bottleneck (standard pyramid). This concentrates
+    parameters where spatial resolution is low and representational richness
+    is needed most.
 
     Inputs
     ------
@@ -96,19 +114,30 @@ class Unet6R_05x(nn.Module):
       clim : (B, 1, H, W)  conditioning climatology (normalized)
       t    : (B,)           flow time in [0, 1]
 
-    The two spatial fields are concatenated -> (B, 2, H, W) before the encoder.
-    Time t is encoded as a sinusoidal embedding and added to the bottleneck.
+    xt and clim are concatenated -> (B, 2, H, W) before the encoder.
+    Time t is sinusoidally embedded and injected additively at the bottleneck.
 
     Output
     ------
       (B, 1, H, W)  predicted velocity field  v ≈ x1 - x0
+
+    Parameters
+    ----------
+    base_channels : int
+        Controls overall model size. Channel counts at each level are
+        base * [1, 2, 4, 8, 16, 32, 64]. Recommended values:
+          2  — dev/MPS (fast iteration)
+          4  — mid (GPU training)
+          8  — large (upper bound)
     """
     def __init__(self, input_channels=2, output_channels=1,
-                 kernel_size=3, p_drop=0.1, gn_groups=1):
+                 base_channels=4, kernel_size=3, p_drop=0.0, gn_groups=1):
         super().__init__()
-        k = kernel_size
-        c1, c2, c4, c8, c16, c32, c64 = 256, 128, 64, 32, 16, 8, 8
+        k  = kernel_size
+        b  = base_channels
+        c1, c2, c4, c8, c16, c32, c64 = (b, b*2, b*4, b*8, b*16, b*32, b*64)
 
+        # time embedding projects to bottleneck channel count
         self.t_emb = SinusoidalEmbedding(dim=64, out_dim=c64)
 
         # encoder
@@ -161,8 +190,8 @@ class Unet6R_05x(nn.Module):
         x5 = self.enc5(x4p); x5p = self.pool5(x5)
         x6 = self.enc6(x5p); x6p = self.pool6(x6)
 
-        b = self.bottleneck(x6p)
-        b = b + self.t_emb(t)[:, :, None, None]   # inject time embedding
+        b  = self.bottleneck(x6p)
+        b  = b + self.t_emb(t)[:, :, None, None]   # inject time embedding
 
         u1 = self.upconv1(b);  d1 = self.dec1(torch.cat([u1, x6], dim=1))
         u2 = self.upconv2(d1); d2 = self.dec2(torch.cat([u2, x5], dim=1))

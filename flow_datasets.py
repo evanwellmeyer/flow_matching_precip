@@ -53,30 +53,24 @@ def model_family(model_name):
 
 
 # ── file loading ───────────────────────────────────────────────────────────────
+# all files share the same 128x192 grid, no regridding or rolling needed
 
 def load_nc_field(path, var):
-    """
-    Load `var` from a NetCDF file.
-    Returns float32 array of shape (members, lat, lon).
-    Adds a member dim if the variable is 2D.
-    """
-    ds = xr.open_dataset(path)
-    da = ds[var].values.astype(np.float32)
-    if da.ndim == 2:
-        da = da[np.newaxis]
-    return da
+    """Load `var` from a NetCDF file. Returns float32 (members, lat, lon)."""
+    ds  = xr.open_dataset(path)
+    arr = ds[var].values.astype(np.float32)
+    if arr.ndim == 2:
+        arr = arr[np.newaxis]
+    return arr
 
 
 def load_zarr_field(path, var):
-    """
-    Load `var` from a zarr store.
-    Returns float32 array of shape (members, lat, lon).
-    """
-    ds = xr.open_zarr(path)
-    da = ds[var].values.astype(np.float32)
-    if da.ndim == 2:
-        da = da[np.newaxis]
-    return da
+    """Load `var` from a zarr store. Returns float32 (members, lat, lon)."""
+    ds  = xr.open_zarr(path)
+    arr = ds[var].values.astype(np.float32)
+    if arr.ndim == 2:
+        arr = arr[np.newaxis]
+    return arr
 
 
 # ── trend pool ─────────────────────────────────────────────────────────────────

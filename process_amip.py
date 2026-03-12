@@ -1,6 +1,6 @@
 """
 process_amip.py
-===============
+
 Processes AMIP historic and amip-future4K files for 11 models into:
 
   {out_dir}/AMIP_{MODEL}_clim.zarr    — 1980-2014 hist climatology (lat, lon)
@@ -9,12 +9,21 @@ Processes AMIP historic and amip-future4K files for 11 models into:
   {out_dir}/AMIP_{MODEL}_dPdP.zarr    — future4K - hist clim, normalized
                                          by global mean (dimensionless)
 
-All outputs are on the native model grid regridded to 128x192.
+All outputs are on the native model grid regridded to 128x192 with
+longitude ranging from -180 to 180.
+
 Processing follows the same conventions as process_cmip6_by_model.py:
   - clim/trend computed on native grid, regridded as 2D fields
   - dPdP computed on regridded grid after regridding future and hist means
   - trend normalized by global_mean(trend)
   - dPdP normalized by global_mean(dP)
+
+TARGET GRID
+-----------
+The target grid is read directly from an existing PPE file (HadGEM or CESM2)
+so that AMIP outputs land on exactly the same lat/lon coordinates used by
+the PPE and land-mask data.  This avoids subtle coordinate mismatches that
+would otherwise appear when using np.linspace to approximate a Gaussian grid.
 """
 
 import re
@@ -33,10 +42,45 @@ HIST_Y0, HIST_Y1 = 1979, 2014
 MIN_HIST_YRS     = 10
 MIN_FUTR_YRS     = 10
 
+# ---------------------------------------------------------------------------
+# Target grid: read from an existing PPE file so coordinates match exactly.
+# Fall back to the CESM2 file if HadGEM is missing, and vice versa.
+# ---------------------------------------------------------------------------
+_PPE_GRID_CANDIDATES = [
+    Path("/Users/ewellmeyer/Documents/research/HadGEM/GA789_PR_his_rg128.nc"),
+    Path("/Users/ewellmeyer/Documents/research/CESM2/CESM2_PR_his_rg128.nc"),
+]
 
-N_LAT, N_LON = 128, 192
-TARGET_LAT = np.linspace(-90 + 180/N_LAT/2,  90 - 180/N_LAT/2, N_LAT)
-TARGET_LON = np.linspace(  0 + 360/N_LON/2, 360 - 360/N_LON/2, N_LON)
+
+def _load_target_grid():
+    """
+    Read TARGET_LAT and TARGET_LON from the first available PPE file.
+
+    The PPE files use coordinate names 'latitude'/'longitude', so we
+    check for both naming conventions.  Returns (lat_array, lon_array).
+    """
+    for candidate in _PPE_GRID_CANDIDATES:
+        if candidate.exists():
+            ds = xr.open_dataset(candidate)
+            # resolve coordinate names
+            lat_name = "latitude" if "latitude" in ds.coords else "lat"
+            lon_name = "longitude" if "longitude" in ds.coords else "lon"
+            lat = ds.coords[lat_name].values.astype(np.float64)
+            lon = ds.coords[lon_name].values.astype(np.float64)
+            ds.close()
+            print(f"Target grid loaded from {candidate.name}")
+            print(f"  lat: [{lat.min():.4f}, {lat.max():.4f}]  n={len(lat)}")
+            print(f"  lon: [{lon.min():.4f}, {lon.max():.4f}]  n={len(lon)}")
+            return lat, lon
+
+    raise FileNotFoundError(
+        "No PPE reference grid found.  Ensure at least one of these exists:\n"
+        + "\n".join(f"  {p}" for p in _PPE_GRID_CANDIDATES)
+    )
+
+
+TARGET_LAT, TARGET_LON = _load_target_grid()
+N_LAT, N_LON = len(TARGET_LAT), len(TARGET_LON)
 
 GCM_FAMILIES = {
     "CCM0B":   ["BCC-CSM2-MR", "CESM2", "E3SM-1-0", "TaiESM1",
@@ -73,8 +117,10 @@ def open_pr(path):
     if "longitude" in pr.dims: renames["longitude"] = "lon"
     if renames:
         pr = pr.rename(renames)
-    if float(pr.coords["lon"].min()) < 0:
-        pr = pr.assign_coords(lon=(pr.coords["lon"] % 360))
+    # convert to -180 to 180 if needed
+    lon = pr.coords["lon"].values
+    if lon.max() > 180:
+        pr = pr.assign_coords(lon=((pr.coords["lon"] + 180) % 360) - 180)
         pr = pr.sortby("lon")
     pr = pr.sortby("time")
     _, idx = np.unique(pr.time.values, return_index=True)
@@ -105,7 +151,9 @@ def linear_trend_field(da):
 
 
 def make_regridder(da_in):
-    ds_out = xr.Dataset({"lat": TARGET_LAT, "lon": TARGET_LON})
+    """Build a bilinear regridder to the PPE-derived target grid."""
+    ds_out = xr.Dataset({"lat": ("lat", TARGET_LAT),
+                         "lon": ("lon", TARGET_LON)})
     return xe.Regridder(da_in, ds_out, method="bilinear",
                         periodic=True, reuse_weights=False)
 
@@ -217,7 +265,8 @@ def process_model(model_name, hist_path, futr_path, out_dir):
     ds_clim = xr.Dataset(
         {"pr_clim": clim_rg},
         attrs=dict(model=model_name, family=family,
-                   period=f"{HIST_Y0}-{HIST_Y1}", units="mm/yr")
+                   period=f"{HIST_Y0}-{HIST_Y1}", units="mm/yr",
+                   longitude_range="-180 to 180")
     )
     safe_zarr_write(ds_clim, Path(str(prefix) + "_clim.zarr"))
 
@@ -226,7 +275,8 @@ def process_model(model_name, hist_path, futr_path, out_dir):
             {"pr_trend": tr_rg},
             attrs=dict(model=model_name, family=family,
                        period=f"{HIST_Y0}-{HIST_Y1}",
-                       units="dimensionless (normalized by global mean trend)")
+                       units="dimensionless (normalized by global mean trend)",
+                       longitude_range="-180 to 180")
         )
         safe_zarr_write(ds_trend, Path(str(prefix) + "_trend.zarr"))
 
@@ -236,10 +286,10 @@ def process_model(model_name, hist_path, futr_path, out_dir):
             attrs=dict(model=model_name, family=family,
                        hist_period=f"{HIST_Y0}-{HIST_Y1}",
                        futr_period=f"{HIST_Y0}-{HIST_Y1} +4K",
-                       units="dimensionless")
+                       units="dimensionless",
+                       longitude_range="-180 to 180")
         )
         safe_zarr_write(ds_dpdp, Path(str(prefix) + "_dPdP.zarr"))
-
 
 
 def main():
