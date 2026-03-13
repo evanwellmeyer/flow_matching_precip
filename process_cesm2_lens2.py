@@ -1,39 +1,20 @@
 """
 process_cesm2_lens2.py
 ======================
-Processes CESM2 Large Ensemble v2 (LENS2) zarr files into three outputs
-per forcing group (cmip6, smbb), following the same conventions as
-process_cmip6_by_model.py:
+Processes CESM2 Large Ensemble v2 (LENS2) zarr files into three netCDF
+outputs per forcing group (cmip6, smbb):
 
-  {out_dir}/CESM2-LENS2_cmip6_clim.zarr   — 1980-2014 climatology (lat, lon)
-  {out_dir}/CESM2-LENS2_cmip6_trend.zarr  — per-member trend 1980-2014,
-                                             normalized by global mean
-                                             (member, lat, lon)
-  {out_dir}/CESM2-LENS2_cmip6_dPdP.zarr  — ensemble-mean dP / global_mean(dP)
-                                             2066-2100 vs 1980-2014
-                                             (lat, lon)
+  {out_dir}/CESM2-LENS2_cmip6_clim.nc   — 1980-2014 climatology (lat, lon)
+  {out_dir}/CESM2-LENS2_cmip6_trend.nc  — per-member trend (member, lat, lon)
+  {out_dir}/CESM2-LENS2_cmip6_dPdP.nc   — ensemble-mean dP / global_mean(dP)
   ... and same three for smbb
 
-Input files (all in IN_DIR)
----------------------------
-  cesm2LE-historical-{cmip6,smbb}-{PRECC,PRECL}.zarr
-  cesm2LE-ssp370-{cmip6,smbb}-{PRECC,PRECL}.zarr
+Input files are zarr stores (read with xr.open_zarr).
+Output files are netCDF (read with xr.open_dataset).
 
-Variable notes
---------------
-  PR = PRECC + PRECL  (convective + large-scale)
-  Units: m/s  ->  mm/yr via * 365.25 * 86400 * 1000
-  Calendar: noleap  ->  use_cftime=True when opening
-
-Regridding strategy
--------------------
-Same as process_cmip6_by_model.py:
-  - Clim  : member time-means averaged on native grid -> regrid once
-  - dPdP  : future member time-means averaged on native grid -> regrid once,
-             then dP computed and normalized on 128x192
-  - Trend : per-member 2D trend field computed on native grid -> regrid each
-            (unavoidable since we want per-member output; 2D field is cheap)
-  Both cmip6 and smbb are treated as separate physics groups.
+TARGET GRID
+-----------
+Read directly from an existing PPE file.  Longitude convention -180 to 180.
 """
 
 import shutil
@@ -51,10 +32,33 @@ HIST_Y0, HIST_Y1 = 1980, 2014
 FUTR_Y0, FUTR_Y1 = 2066, 2100
 MIN_YRS          = 10
 
-# target regrid grid
-N_LAT, N_LON = 128, 192
-TARGET_LAT = np.linspace(-90 + 180/N_LAT/2,  90 - 180/N_LAT/2, N_LAT)
-TARGET_LON = np.linspace(  0 + 360/N_LON/2, 360 - 360/N_LON/2, N_LON)
+# ── target grid: read from PPE file ───────────────────────────────────────────
+_PPE_GRID_CANDIDATES = [
+    Path("/Users/ewellmeyer/Documents/research/HadGEM/GA789_PR_his_rg128.nc"),
+    Path("/Users/ewellmeyer/Documents/research/CESM2/CESM2_PR_his_rg128.nc"),
+]
+
+
+def _load_target_grid():
+    for candidate in _PPE_GRID_CANDIDATES:
+        if candidate.exists():
+            ds = xr.open_dataset(candidate)
+            lat_name = "latitude" if "latitude" in ds.coords else "lat"
+            lon_name = "longitude" if "longitude" in ds.coords else "lon"
+            lat = ds.coords[lat_name].values.astype(np.float64)
+            lon = ds.coords[lon_name].values.astype(np.float64)
+            ds.close()
+            print(f"Target grid loaded from {candidate.name}")
+            print(f"  lat: [{lat.min():.4f}, {lat.max():.4f}]  n={len(lat)}")
+            print(f"  lon: [{lon.min():.4f}, {lon.max():.4f}]  n={len(lon)}")
+            return lat, lon
+    raise FileNotFoundError(
+        "No PPE reference grid found.  Ensure at least one of these exists:\n"
+        + "\n".join(f"  {p}" for p in _PPE_GRID_CANDIDATES)
+    )
+
+
+TARGET_LAT, TARGET_LON = _load_target_grid()
 
 FORCINGS = ["cmip6", "smbb"]
 
@@ -65,17 +69,14 @@ def open_pr_zarr(precc_path, precl_path):
     """
     Open PRECC and PRECL zarr stores, add them, convert to mm/yr.
     Returns DataArray (member, time, lat, lon).
-    Uses .values to bypass xarray alignment issues with duplicate time coords.
     """
     time_coder = xr.coders.CFDatetimeCoder(use_cftime=True)
     ds_c = xr.open_zarr(precc_path, decode_times=time_coder)
     ds_l = xr.open_zarr(precl_path, decode_times=time_coder)
 
-    # get lat/lon coord names
     lat_name = "lat" if "lat" in ds_c.coords else "latitude"
     lon_name = "lon" if "lon" in ds_c.coords else "longitude"
 
-    # add using .values to avoid xarray alignment on duplicate time index
     pr_vals = (ds_c["PRECC"].values + ds_l["PRECL"].values) * CONV
     pr = xr.DataArray(
         pr_vals,
@@ -84,29 +85,26 @@ def open_pr_zarr(precc_path, precl_path):
         attrs={"units": "mm/yr"},
     )
 
-    # standardize coord names
     renames = {}
     if lat_name != "lat": renames[lat_name] = "lat"
     if lon_name != "lon": renames[lon_name] = "lon"
     if renames:
         pr = pr.rename(renames)
 
-    # standardize lon to [0, 360)
-    if float(pr.coords["lon"].min()) < 0:
-        pr = pr.assign_coords(lon=(pr.coords["lon"] % 360))
+    lon = pr.coords["lon"].values
+    if lon.max() > 180:
+        pr = pr.assign_coords(lon=((pr.coords["lon"] + 180) % 360) - 180)
         pr = pr.sortby("lon")
 
-    # sort time and drop duplicates
     pr = pr.sortby("time")
     _, idx = np.unique(pr.time.values, return_index=True)
     if len(idx) < pr.sizes["time"]:
         print(f"    INFO: dropped {pr.sizes['time'] - len(idx)} duplicate time steps")
         pr = pr.isel(time=idx)
 
-    # rename member_id dim to member for consistency
     if 'member_id' in pr.dims:
         pr = pr.rename({'member_id': 'member'})
-    return pr   # (member, time, lat, lon)
+    return pr
 
 
 def annual_mean(da):
@@ -124,7 +122,6 @@ def global_mean(da):
 
 
 def linear_trend_field(da):
-    """Per-pixel least-squares trend over time. da: (time, lat, lon)."""
     t = np.arange(len(da.time), dtype=float)
     da = da.assign_coords(time=t)
     p = da.polyfit(dim="time", deg=1)
@@ -132,15 +129,16 @@ def linear_trend_field(da):
 
 
 def make_regridder(da_in):
-    ds_out = xr.Dataset({"lat": TARGET_LAT, "lon": TARGET_LON})
+    ds_out = xr.Dataset({"lat": ("lat", TARGET_LAT),
+                         "lon": ("lon", TARGET_LON)})
     return xe.Regridder(da_in, ds_out, method="bilinear",
                         periodic=True, reuse_weights=False)
 
 
-def safe_zarr_write(ds, path):
+def safe_nc_write(ds, path):
     if path.exists():
-        shutil.rmtree(path)
-    ds.to_zarr(path, mode="w")
+        path.unlink()
+    ds.to_netcdf(path)
     print(f"  -> wrote {path.name}")
 
 
@@ -151,14 +149,13 @@ def process_forcing(forcing, out_dir):
     prefix = out_dir / tag
 
     expected = [Path(str(prefix) + s)
-                for s in ("_clim.zarr", "_trend.zarr", "_dPdP.zarr")]
+                for s in ("_clim.nc", "_trend.nc", "_dPdP.nc")]
     if all(p.exists() for p in expected):
         print(f"\n[{tag}] SKIP: all outputs already exist")
         return
 
     print(f"\n{'='*60}\n[{tag}]")
 
-    # ── locate input files ────────────────────────────────────────────────────
     hist_precc = IN_DIR / f"cesm2LE-historical-{forcing}-PRECC.zarr"
     hist_precl = IN_DIR / f"cesm2LE-historical-{forcing}-PRECL.zarr"
     futr_precc = IN_DIR / f"cesm2LE-ssp370-{forcing}-PRECC.zarr"
@@ -169,7 +166,6 @@ def process_forcing(forcing, out_dir):
             print(f"  SKIP: missing {p.name}")
             return
 
-    # ── load and select years ─────────────────────────────────────────────────
     print("  loading historical...")
     pr_hist_full = open_pr_zarr(hist_precc, hist_precl)
     pr_hist_ann  = annual_mean(pr_hist_full)
@@ -188,28 +184,25 @@ def process_forcing(forcing, out_dir):
         print(f"  SKIP: only {pr_futr.sizes['time']} future years"); return
     print(f"  futr: {pr_futr.sizes['member']} members, {pr_futr.sizes['time']} years")
 
-    # ── build regridder from first member ────────────────────────────────────
     sample = pr_hist.isel(member=0, time=0)
     try:
         regridder = make_regridder(sample)
     except Exception as e:
         print(f"  SKIP: cannot build regridder: {e}"); return
 
-    # ── climatology: member time-means averaged on native grid -> regrid once ─
     print("  computing climatology...")
-    clim_native = pr_hist.mean("time").mean("member")   # (lat, lon)
+    clim_native = pr_hist.mean("time").mean("member")
     clim_rg     = regridder(clim_native)
 
-    # ── trend: per-member on native grid -> regrid 2D field -> normalize ──────
     print("  computing trends...")
-    trend_rg_list   = []
+    trend_rg_list    = []
     valid_member_ids = []
     member_coords = (pr_hist.coords["member"].values
                      if "member" in pr_hist.coords
                      else np.arange(n_members))
 
     for i in range(n_members):
-        da_m = pr_hist.isel(member=i)    # (time, lat, lon)
+        da_m = pr_hist.isel(member=i)
         try:
             tr_native = linear_trend_field(da_m)
             tr_rg     = regridder(tr_native)
@@ -227,7 +220,7 @@ def process_forcing(forcing, out_dir):
         print("  WARN: no valid trends computed")
         trend_stack = None
     else:
-        trend_arr = np.stack(trend_rg_list, axis=0)   # (member, lat, lon)
+        trend_arr = np.stack(trend_rg_list, axis=0)
         trend_stack = xr.DataArray(
             trend_arr,
             dims=["member", "lat", "lon"],
@@ -235,9 +228,8 @@ def process_forcing(forcing, out_dir):
                     "lat": TARGET_LAT, "lon": TARGET_LON},
         )
 
-    # ── dPdP: future member time-means averaged on native grid -> regrid once ─
     print("  computing dPdP...")
-    futr_native = pr_futr.mean("time").mean("member")   # (lat, lon)
+    futr_native = pr_futr.mean("time").mean("member")
     futr_rg     = regridder(futr_native)
 
     dP = futr_rg - clim_rg
@@ -248,16 +240,16 @@ def process_forcing(forcing, out_dir):
     else:
         dPdP = dP / gm
 
-    # ── write outputs ─────────────────────────────────────────────────────────
     out_dir.mkdir(parents=True, exist_ok=True)
 
     ds_clim = xr.Dataset(
         {"pr_clim": clim_rg},
         attrs=dict(model="CESM2-LENS2", forcing=forcing,
                    period=f"{HIST_Y0}-{HIST_Y1}", units="mm/yr",
-                   n_members=n_members)
+                   n_members=n_members,
+                   longitude_range="-180 to 180")
     )
-    safe_zarr_write(ds_clim, Path(str(prefix) + "_clim.zarr"))
+    safe_nc_write(ds_clim, Path(str(prefix) + "_clim.nc"))
 
     if trend_stack is not None:
         ds_trend = xr.Dataset(
@@ -265,9 +257,10 @@ def process_forcing(forcing, out_dir):
             attrs=dict(model="CESM2-LENS2", forcing=forcing,
                        period=f"{HIST_Y0}-{HIST_Y1}",
                        units="dimensionless (normalized by global mean trend)",
-                       n_members=len(valid_member_ids))
+                       n_members=len(valid_member_ids),
+                       longitude_range="-180 to 180")
         )
-        safe_zarr_write(ds_trend, Path(str(prefix) + "_trend.zarr"))
+        safe_nc_write(ds_trend, Path(str(prefix) + "_trend.nc"))
 
     if dPdP is not None:
         ds_dpdp = xr.Dataset(
@@ -276,9 +269,10 @@ def process_forcing(forcing, out_dir):
                        hist_period=f"{HIST_Y0}-{HIST_Y1}",
                        futr_period=f"{FUTR_Y0}-{FUTR_Y1}",
                        units="dimensionless",
-                       n_members=n_members)
+                       n_members=n_members,
+                       longitude_range="-180 to 180")
         )
-        safe_zarr_write(ds_dpdp, Path(str(prefix) + "_dPdP.zarr"))
+        safe_nc_write(ds_dpdp, Path(str(prefix) + "_dPdP.nc"))
 
 
 # ── main ───────────────────────────────────────────────────────────────────────

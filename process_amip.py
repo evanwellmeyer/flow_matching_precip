@@ -3,14 +3,13 @@ process_amip.py
 
 Processes AMIP historic and amip-future4K files for 11 models into:
 
-  {out_dir}/AMIP_{MODEL}_clim.zarr    — 1980-2014 hist climatology (lat, lon)
-  {out_dir}/AMIP_{MODEL}_trend.zarr   — 1980-2014 hist trend, normalized
-                                         by global mean (dimensionless)
-  {out_dir}/AMIP_{MODEL}_dPdP.zarr    — future4K - hist clim, normalized
-                                         by global mean (dimensionless)
+  {out_dir}/AMIP_{MODEL}_clim.nc    — 1980-2014 hist climatology (lat, lon)
+  {out_dir}/AMIP_{MODEL}_trend.nc   — 1980-2014 hist trend, normalized
+                                       by global mean (dimensionless)
+  {out_dir}/AMIP_{MODEL}_dPdP.nc    — future4K - hist clim, normalized
+                                       by global mean (dimensionless)
 
-All outputs are on the native model grid regridded to 128x192 with
-longitude ranging from -180 to 180.
+All outputs are on the PPE reference grid (128x192 Gaussian, lon -180 to 180).
 
 Processing follows the same conventions as process_cmip6_by_model.py:
   - clim/trend computed on native grid, regridded as 2D fields
@@ -20,14 +19,12 @@ Processing follows the same conventions as process_cmip6_by_model.py:
 
 TARGET GRID
 -----------
-The target grid is read directly from an existing PPE file (HadGEM or CESM2)
-so that AMIP outputs land on exactly the same lat/lon coordinates used by
-the PPE and land-mask data.  This avoids subtle coordinate mismatches that
-would otherwise appear when using np.linspace to approximate a Gaussian grid.
+Read directly from an existing PPE file (HadGEM or CESM2) so that AMIP
+outputs land on exactly the same lat/lon coordinates as the PPE and
+land-mask data.
 """
 
 import re
-import shutil
 from pathlib import Path
 
 import numpy as np
@@ -42,10 +39,7 @@ HIST_Y0, HIST_Y1 = 1979, 2014
 MIN_HIST_YRS     = 10
 MIN_FUTR_YRS     = 10
 
-# ---------------------------------------------------------------------------
-# Target grid: read from an existing PPE file so coordinates match exactly.
-# Fall back to the CESM2 file if HadGEM is missing, and vice versa.
-# ---------------------------------------------------------------------------
+# ── target grid: read from PPE file ───────────────────────────────────────────
 _PPE_GRID_CANDIDATES = [
     Path("/Users/ewellmeyer/Documents/research/HadGEM/GA789_PR_his_rg128.nc"),
     Path("/Users/ewellmeyer/Documents/research/CESM2/CESM2_PR_his_rg128.nc"),
@@ -53,16 +47,9 @@ _PPE_GRID_CANDIDATES = [
 
 
 def _load_target_grid():
-    """
-    Read TARGET_LAT and TARGET_LON from the first available PPE file.
-
-    The PPE files use coordinate names 'latitude'/'longitude', so we
-    check for both naming conventions.  Returns (lat_array, lon_array).
-    """
     for candidate in _PPE_GRID_CANDIDATES:
         if candidate.exists():
             ds = xr.open_dataset(candidate)
-            # resolve coordinate names
             lat_name = "latitude" if "latitude" in ds.coords else "lat"
             lon_name = "longitude" if "longitude" in ds.coords else "lon"
             lat = ds.coords[lat_name].values.astype(np.float64)
@@ -72,7 +59,6 @@ def _load_target_grid():
             print(f"  lat: [{lat.min():.4f}, {lat.max():.4f}]  n={len(lat)}")
             print(f"  lon: [{lon.min():.4f}, {lon.max():.4f}]  n={len(lon)}")
             return lat, lon
-
     raise FileNotFoundError(
         "No PPE reference grid found.  Ensure at least one of these exists:\n"
         + "\n".join(f"  {p}" for p in _PPE_GRID_CANDIDATES)
@@ -80,7 +66,6 @@ def _load_target_grid():
 
 
 TARGET_LAT, TARGET_LON = _load_target_grid()
-N_LAT, N_LON = len(TARGET_LAT), len(TARGET_LON)
 
 GCM_FAMILIES = {
     "CCM0B":   ["BCC-CSM2-MR", "CESM2", "E3SM-1-0", "TaiESM1",
@@ -95,6 +80,7 @@ GCM_FAMILIES = {
     "IPSL":    ["IPSL-CM6A-LR"],
 }
 
+
 def model_family(model_name):
     for fam, members in GCM_FAMILIES.items():
         if model_name in members:
@@ -103,7 +89,6 @@ def model_family(model_name):
 
 
 def model_from_filename(fname):
-    """Extract model name from CMIP6-style AMIP filename."""
     m = re.match(r'pr_Amon_([^_]+)_amip', fname)
     return m.group(1) if m else None
 
@@ -117,7 +102,6 @@ def open_pr(path):
     if "longitude" in pr.dims: renames["longitude"] = "lon"
     if renames:
         pr = pr.rename(renames)
-    # convert to -180 to 180 if needed
     lon = pr.coords["lon"].values
     if lon.max() > 180:
         pr = pr.assign_coords(lon=((pr.coords["lon"] + 180) % 360) - 180)
@@ -151,51 +135,42 @@ def linear_trend_field(da):
 
 
 def make_regridder(da_in):
-    """Build a bilinear regridder to the PPE-derived target grid."""
     ds_out = xr.Dataset({"lat": ("lat", TARGET_LAT),
                          "lon": ("lon", TARGET_LON)})
     return xe.Regridder(da_in, ds_out, method="bilinear",
                         periodic=True, reuse_weights=False)
 
 
-def safe_zarr_write(ds, path):
+def safe_nc_write(ds, path):
     if path.exists():
-        shutil.rmtree(path)
-    ds.to_zarr(path, mode="w")
+        path.unlink()
+    ds.to_netcdf(path)
     print(f"  -> wrote {path.name}")
 
 
 def find_file_pairs():
-    """
-    Match hist and future4K files by model name.
-    Returns list of (model_name, hist_path, futr_path).
-    """
     hist_files = {model_from_filename(f.name): f
                   for f in sorted(HIST_DIR.glob("pr_Amon_*_amip_*.nc"))
                   if model_from_filename(f.name)}
-
     futr_files = {model_from_filename(f.name): f
                   for f in sorted(FUTR_DIR.glob("pr_Amon_*_amip-future4K_*.nc"))
                   if model_from_filename(f.name)}
-
     pairs = []
     for model in sorted(set(hist_files) & set(futr_files)):
         pairs.append((model, hist_files[model], futr_files[model]))
-
     missing_futr = set(hist_files) - set(futr_files)
     missing_hist = set(futr_files) - set(hist_files)
     if missing_futr:
         print(f"WARN: no future file for: {sorted(missing_futr)}")
     if missing_hist:
         print(f"WARN: no hist file for: {sorted(missing_hist)}")
-
     return pairs
 
 
 def process_model(model_name, hist_path, futr_path, out_dir):
     prefix = out_dir / f"AMIP_{model_name}"
     expected = [Path(str(prefix) + s)
-                for s in ("_clim.zarr", "_trend.zarr", "_dPdP.zarr")]
+                for s in ("_clim.nc", "_trend.nc", "_dPdP.nc")]
     if all(p.exists() for p in expected):
         print(f"  [{model_name}] SKIP: all outputs already exist")
         return
@@ -268,7 +243,7 @@ def process_model(model_name, hist_path, futr_path, out_dir):
                    period=f"{HIST_Y0}-{HIST_Y1}", units="mm/yr",
                    longitude_range="-180 to 180")
     )
-    safe_zarr_write(ds_clim, Path(str(prefix) + "_clim.zarr"))
+    safe_nc_write(ds_clim, Path(str(prefix) + "_clim.nc"))
 
     if trend_ok:
         ds_trend = xr.Dataset(
@@ -278,7 +253,7 @@ def process_model(model_name, hist_path, futr_path, out_dir):
                        units="dimensionless (normalized by global mean trend)",
                        longitude_range="-180 to 180")
         )
-        safe_zarr_write(ds_trend, Path(str(prefix) + "_trend.zarr"))
+        safe_nc_write(ds_trend, Path(str(prefix) + "_trend.nc"))
 
     if dpdp_ok:
         ds_dpdp = xr.Dataset(
@@ -289,7 +264,7 @@ def process_model(model_name, hist_path, futr_path, out_dir):
                        units="dimensionless",
                        longitude_range="-180 to 180")
         )
-        safe_zarr_write(ds_dpdp, Path(str(prefix) + "_dPdP.zarr"))
+        safe_nc_write(ds_dpdp, Path(str(prefix) + "_dPdP.nc"))
 
 
 def main():
