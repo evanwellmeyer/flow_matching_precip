@@ -18,7 +18,8 @@ Loss
 ----
 Weighted MSE with a land mask: ocean pixels are downweighted to focus
 the model on land precipitation where predictions matter and the physics
-are more constrained. Loss = mean( mask * (v_pred - v_target)^2 ).
+are more constrained. A small endpoint penalty is added near t=1 to
+encourage the learned velocity field to decay toward zero.
 
 Training data
 -------------
@@ -37,9 +38,9 @@ import time
 from pathlib import Path
 
 import numpy as np
-import torch
-import torch.nn.functional as F
-from torch.utils.data import DataLoader
+import torch                           
+import torch.nn.functional as F         
+from torch.utils.data import DataLoader 
 import xarray as xr
 
 from flow_models   import Unet6R
@@ -55,20 +56,38 @@ WEIGHTS_DIR    = Path("/Users/ewellmeyer/Documents/research/weights")
 
 
 N_ENSEMBLE   = 5
-PATIENCE     = 30
+PATIENCE     = 50
 BATCH_SIZE   = 100
-LR           = 1e-3
+LR           = 1e-2
 N_EPOCHS     = 1000
 GRAD_CLIP    = 1.0
 P_DROP       = 0.0
-P_AUG        = 0.8   # probability of cross-model trend augmentation (AMIP)
+P_AUG        = 0.25   # probability of cross-model trend augmentation (AMIP)
+P_NOISE      = 0.25  # probability of replacing x0 with Gaussian noise
+P_ZERO       = 0.25  # probability of replacing x0 with zeros
 LAND_WEIGHT  = 1.0   # loss weight for land pixels
-OCEAN_WEIGHT = 0.3   # loss weight for ocean pixels (soft downweight for base)
+OCEAN_WEIGHT = 0.5   # loss weight for ocean pixels (soft downweight for base)
+T_BETA_ALPHA = 0.5   # <1 biases t samples toward 0 and 1
+T_BETA_BETA  = 0.5
+ENDPOINT_PENALTY_WEIGHT = 0.05
+ENDPOINT_PENALTY_START  = 0.8
 USE_AMP      = True
 DEVICE       = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
-BASE_CHANNELS = 8
-EXPT_NAME   = f"flow_base_unet6R_ch{BASE_CHANNELS}_land10_oce{OCEAN_WEIGHT}_aug{P_AUG}"
+BASE_CHANNELS = 16
+if P_AUG + P_NOISE + P_ZERO > 1.0:
+    raise ValueError("P_AUG + P_NOISE + P_ZERO must be <= 1.0")
+if min(T_BETA_ALPHA, T_BETA_BETA) <= 0.0:
+    raise ValueError("Beta time-sampling parameters must be positive")
+if not 0.0 <= ENDPOINT_PENALTY_START < 1.0:
+    raise ValueError("ENDPOINT_PENALTY_START must lie in [0, 1)")
+
+EXPT_NAME   = (
+    f"flow_base_unet6R_ch{BASE_CHANNELS}_land10_oce{OCEAN_WEIGHT}"
+    f"_aug{P_AUG}_noise{P_NOISE}_zero{P_ZERO}"
+    f"_tbeta{T_BETA_ALPHA}_{T_BETA_BETA}"
+    f"_vend{ENDPOINT_PENALTY_WEIGHT}"
+)
 WEIGHTS_DIR = WEIGHTS_DIR / EXPT_NAME
 WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -89,6 +108,23 @@ def masked_mse(v_pred, v_target, mask):
       mask             : (B, 1, H, W)  per-pixel weights
     """
     return (mask * (v_pred - v_target) ** 2).mean()
+
+
+def sample_times(batch_size, device):
+    """Sample t with extra mass near the boundaries when alpha,beta < 1."""
+    if T_BETA_ALPHA == 1.0 and T_BETA_BETA == 1.0:
+        return torch.rand(batch_size, device=device)
+    dist = torch.distributions.Beta(T_BETA_ALPHA, T_BETA_BETA)
+    return dist.sample((batch_size,)).to(device=device)
+
+
+def endpoint_velocity_penalty(v_pred, mask, t):
+    """
+    Penalize residual velocity near t=1 so integration settles at the endpoint.
+    """
+    gate = F.relu((t - ENDPOINT_PENALTY_START) / (1.0 - ENDPOINT_PENALTY_START))
+    gate = gate[:, None, None, None]
+    return (gate * mask * v_pred.square()).mean()
 
 
 def main():
@@ -176,6 +212,8 @@ def main():
         clim_mean = clim_mean,
         clim_std  = clim_std,
         p_aug     = P_AUG,
+        p_noise   = P_NOISE,
+        p_zero    = P_ZERO,
         length    = 10000,
         land_mask = land_mask_weights,
     )
@@ -197,7 +235,7 @@ def main():
     # ensemble training loop
     # =========================================================================
 
-    for member_idx in range(N_ENSEMBLE):
+    for member_idx in range(0, N_ENSEMBLE):
         print(f"\n{'='*60}")
         print(f"Ensemble member {member_idx}")
         print(f"{'='*60}")
@@ -241,14 +279,15 @@ def main():
             # ── train ─────────────────────────────────────────────────────────
             model.train()
             train_loss = 0.0
-            n_batches  = len(train_loader)
+            train_mse = 0.0
+            train_endpoint = 0.0
             t_epoch    = time.time()
 
-            for batch_idx, (clim, x0, x1, mask) in enumerate(train_loader):
+            for clim, x0, x1, mask in train_loader:
                 clim, x0, x1, mask = (clim.to(DEVICE), x0.to(DEVICE),
                                        x1.to(DEVICE),  mask.to(DEVICE))
                 B  = clim.shape[0]
-                t  = torch.rand(B, device=DEVICE)
+                t  = sample_times(B, DEVICE)
                 t4 = t[:, None, None, None]
                 xt = (1 - t4) * x0 + t4 * x1
 
@@ -256,7 +295,9 @@ def main():
                 with torch.autocast(device_type=DEVICE.type,
                                     enabled=scaler is not None):
                     v_pred = model(xt, clim, t)
-                    loss   = masked_mse(v_pred, x1 - x0, mask)
+                    mse_loss = masked_mse(v_pred, x1 - x0, mask)
+                    endpoint_loss = endpoint_velocity_penalty(v_pred, mask, t)
+                    loss = mse_loss + ENDPOINT_PENALTY_WEIGHT * endpoint_loss
 
                 if scaler is not None:
                     scaler.scale(loss).backward()
@@ -270,37 +311,59 @@ def main():
                     optimizer.step()
 
                 train_loss += loss.item()
+                train_mse += mse_loss.item()
+                train_endpoint += endpoint_loss.item()
 
             train_loss /= len(train_loader)
+            train_mse /= len(train_loader)
+            train_endpoint /= len(train_loader)
 
             # ── validate ──────────────────────────────────────────────────────
             model.eval()
             val_loss = 0.0
+            val_mse = 0.0
+            val_endpoint = 0.0
             with torch.no_grad():
                 for clim, x0, x1, mask in val_loader:
                     clim, x0, x1, mask = (clim.to(DEVICE), x0.to(DEVICE),
                                            x1.to(DEVICE),  mask.to(DEVICE))
                     B  = clim.shape[0]
-                    t  = torch.rand(B, device=DEVICE)
+                    t  = sample_times(B, DEVICE)
                     t4 = t[:, None, None, None]
                     xt = (1 - t4) * x0 + t4 * x1
-                    v_pred    = model(xt, clim, t)
-                    val_loss += masked_mse(v_pred, x1 - x0, mask).item()
+                    v_pred = model(xt, clim, t)
+                    mse_loss = masked_mse(v_pred, x1 - x0, mask)
+                    endpoint_loss = endpoint_velocity_penalty(v_pred, mask, t)
+                    val_loss += (mse_loss + ENDPOINT_PENALTY_WEIGHT * endpoint_loss).item()
+                    val_mse += mse_loss.item()
+                    val_endpoint += endpoint_loss.item()
             val_loss /= len(val_loader)
+            val_mse /= len(val_loader)
+            val_endpoint /= len(val_loader)
 
             scheduler.step()
             epoch_time = time.time() - t_epoch
-            log.append({"epoch": epoch, "train": train_loss, "val": val_loss,
-                        "epoch_time": epoch_time})
+            log.append({
+                "epoch": epoch,
+                "train": train_loss,
+                "train_mse": train_mse,
+                "train_endpoint": train_endpoint,
+                "val": val_loss,
+                "val_mse": val_mse,
+                "val_endpoint": val_endpoint,
+                "epoch_time": epoch_time,
+            })
 
             if epoch % 1 == 0:
                 elapsed_total = time.time() - epoch_start
                 epochs_done = epoch - start_epoch + 1
                 eta = elapsed_total / epochs_done * (N_EPOCHS - epoch)
+                improved = "  *" if val_loss < best_val else ""
                 print(f"  epoch {epoch:3d}/{N_EPOCHS}  "
-                      f"train={train_loss:.5f}  val={val_loss:.5f}  "
+                      f"train={train_loss:.5f} (mse={train_mse:.5f}, end={train_endpoint:.5f})  "
+                      f"val={val_loss:.5f} (mse={val_mse:.5f}, end={val_endpoint:.5f})  "
                       f"{epoch_time:.1f}s/epoch  "
-                      f"ETA {eta/60:.1f}min")
+                      f"ETA {eta/60:.1f}min{improved}")
 
             if val_loss < best_val:
                 best_val       = val_loss
@@ -311,6 +374,13 @@ def main():
                     "val_loss":   val_loss,
                     "clim_mean":  clim_mean,
                     "clim_std":   clim_std,
+                    "p_aug":      P_AUG,
+                    "p_noise":    P_NOISE,
+                    "p_zero":     P_ZERO,
+                    "t_beta_alpha": T_BETA_ALPHA,
+                    "t_beta_beta": T_BETA_BETA,
+                    "endpoint_penalty_weight": ENDPOINT_PENALTY_WEIGHT,
+                    "endpoint_penalty_start": ENDPOINT_PENALTY_START,
                 }, save_path)
             else:
                 patience_count += 1

@@ -115,9 +115,11 @@ class FlowDataset(Dataset):
     x0 selection
     ------------
     For AMIP sources (is_ppe=False):
-      With probability p_aug, replace x0 with a trend sampled from the
-      same family's trend pool (cross-model augmentation).
-      Otherwise use the member's own trend.
+      Sample one mutually exclusive x0 branch:
+        - own member trend
+        - same-family trend augmentation with probability p_aug
+        - Gaussian noise with probability p_noise
+        - zeros with probability p_zero
     For PPE sources (is_ppe=True):
       Always sample x0 from the family trend pool since the PPE runs are
       too short to compute meaningful trends.
@@ -135,16 +137,23 @@ class FlowDataset(Dataset):
     clim_mean : float  global mean of clim across all training data (mm/yr)
     clim_std  : float  global std  of clim across all training data (mm/yr)
     p_aug     : float  probability of cross-model trend augmentation
+    p_noise   : float  probability of replacing x0 with Gaussian noise
+    p_zero    : float  probability of replacing x0 with zeros
     length    : int    virtual dataset length (samples per epoch)
     land_mask : (H, W) float32 array of pixel weights, or None for uniform
     """
 
     def __init__(self, sources, clim_mean, clim_std,
-                 p_aug=0.8, length=10000, land_mask=None):
+                 p_aug=0.8, p_noise=0.0, p_zero=0.0,
+                 length=10000, land_mask=None):
+        if p_aug + p_noise + p_zero > 1.0:
+            raise ValueError("p_aug + p_noise + p_zero must be <= 1.0")
         self.sources   = sources
         self.clim_mean = clim_mean
         self.clim_std  = clim_std
         self.p_aug     = p_aug
+        self.p_noise   = p_noise
+        self.p_zero    = p_zero
         self._len      = length
         self.land_mask = land_mask   # (H, W) float32 or None
 
@@ -182,10 +191,18 @@ class FlowDataset(Dataset):
 
         # x0 selection
         pool = self._get_pool(src["family"])
-        if src["is_ppe"] or random.random() < self.p_aug:
+        if src["is_ppe"]:
             x0 = pool.sample()
         else:
             x0 = src["x0"][idx]
+            r = random.random()
+            if r < self.p_aug:
+                x0 = pool.sample()
+            elif r < self.p_aug + self.p_noise:
+                noise_std = random.uniform(0.5, 2.0)
+                x0 = np.random.randn(*x0.shape).astype(np.float32) * noise_std
+            elif r < self.p_aug + self.p_noise + self.p_zero:
+                x0 = np.zeros_like(x0)
 
         # replace NaNs with zero (land-only models may have ocean NaNs)
         clim_norm = np.nan_to_num(clim_norm, nan=0.0)
